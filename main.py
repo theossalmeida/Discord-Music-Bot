@@ -2,14 +2,33 @@ from random import choice
 import discord
 from discord.ext import commands
 import yt_dlp as youtube_dl
-from youtubesearchpython import VideosSearch
+from py_yt import VideosSearch
 import os
+from load_dotenv import load_dotenv
+
+'''
+PT-BR:
+    Lembre-se de alterar/criar seu arquivo .env com o caminho da pasta de imagens e application id.
+
+EN-US:
+    Remember to create/change your .env file with informations about image folder path and application id
+'''
+
+load_dotenv()
+
+IMG_FOLDER_PATH = os.getenv('IMG_FOLDER_PATH')
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+
+if not DISCORD_TOKEN or not IMG_FOLDER_PATH:
+    print('Please make sure you have DISCORD_TOKEN and IMG_FOLDER_PATH on your .env file, also check for the name of the variables')
+    print('Por favor, certifique-se que as variáveis DISCORD_TOKEN e IMG_FOLDER_PATH estao corretamente salvas no .env')
+    raise Exception
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-images_folder = '*Your images folder path here*'
+images_folder = IMG_FOLDER_PATH
 
 # Class to manage music queue
 class MusicQueue:
@@ -40,7 +59,7 @@ async def on_ready():
     # Send message in discord chat when bot is turned on
     for guild in bot.guilds:
         text_channel = guild.text_channels[0]
-        await text_channel.send(file=discord.File(os.path.join(images_folder, 'welcome.jpg')), content="Rei Macaco na área!")
+        await text_channel.send(file=discord.File(os.path.join(images_folder, 'welcome.png')), content="Rei Macaco na área!")
 
 @bot.command(name='play', help='Busca e reproduz uma música do YouTube')
 async def play(ctx, *, search):
@@ -52,10 +71,17 @@ async def play(ctx, *, search):
     channel = ctx.author.voice.channel
 
     # Search for the video user entered
-    videos_search = VideosSearch(search, limit=1)
-    video_result = videos_search.result()['result'][0]
-    url = video_result['link']
-    
+    videos_search = VideosSearch(search, limit=1, region='BR')
+    try:
+        video_result = await videos_search.next()
+        print(video_result['result'][0]['link'])
+        url = video_result['result'][0]['link']
+    except Exception as e:
+        print(f'Erro ao pesquisar musica: {e}')
+        # Images to be sent when bot can't find the music
+        await ctx.send(file=discord.File(os.path.join(images_folder, 'erro.png')), content="Houve um problema ao tentar buscar a música.")
+        return
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'postprocessors': [{
@@ -142,4 +168,4 @@ async def leave(ctx):
     else:
         await ctx.send("O bot não está conectado a nenhum canal de voz.")
 
-bot.run(' *Your Discord Application ID* ')
+bot.run(DISCORD_TOKEN)
