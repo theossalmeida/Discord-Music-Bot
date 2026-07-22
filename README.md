@@ -1,35 +1,63 @@
 # Discord Music Bot
 
-This is a Discord bot that allows users to search and play music from YouTube in their voice channels. The bot also manages a music queue, can skip to the next song, and displays the current queue.
+Bot pessoal que busca músicas no YouTube, reproduz em canais de voz e mantém
+uma fila separada para cada servidor.
 
-Feel free to contact me for any doubt: theoalmeida00@gmail.com
+## Comandos
 
-## Features
+- `!play <música>` — busca e adiciona uma música à fila
+- `!next` / `!skip` — pula a música atual
+- `!fila` / `!queue` — mostra a fila
+- `!leave` — limpa a fila e desconecta o bot
 
-- **Play Music:** Search for a song on YouTube and play it in a voice channel.
-- **Queue Management:** Add songs to a queue and skip to the next song.
-- **Display Queue:** Show the current list of songs in the queue.
-- **Leave Channel:** Disconnect the bot from the voice channel.
+## Desenvolvimento local
 
-## Getting Started
-
-### Prerequisites
-
-- Python 3.8+
-- [discord.py](https://pypi.org/project/discord.py/)
-- [yt-dlp](https://pypi.org/project/yt-dlp/)
-- [yt-yt-search](https://pypi.org/project/youtube-search-python/)
-
-### Discord requisities
-- Create a discord application: https://discordjs.guide/preparations/setting-up-a-bot-application.html#creating-your-bot
-- Create a server and add the bot: https://umatechnology.org/how-to-create-a-discord-bot-and-add-it-to-your-server/
-
-### Local requisities
-- Create a .env file containing:
-    1- DISCORD_TOKEN -> your bot token (view the tutorial above)
-    2- IMG_FOLDER_PATH -> your local folder containing your images for the bot reaction to messages
-
-You can install the required packages using pip:
+Requer Python 3.11+, FFmpeg e libopus.
 
 ```bash
-pip install discord.py yt-dlp yt-yt-search
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Crie um `.env` (ele não deve ser commitado):
+
+```dotenv
+DISCORD_TOKEN=seu_token
+# Opcional: conteúdo completo de um arquivo Netscape cookies.txt
+YOUTUBE_COOKIES=
+```
+
+Ative também o **Message Content Intent** na página do bot no Discord Developer
+Portal. Depois execute `python main.py`.
+
+## Fly.io
+
+O bot é um processo worker e não precisa expor portas HTTP. Configure os secrets
+e faça o deploy a partir da pasta do projeto:
+
+```bash
+fly secrets set DISCORD_TOKEN='seu_token'
+fly deploy
+```
+
+Se o YouTube exigir autenticação, salve o conteúdo do arquivo de cookies como
+secret sem colocá-lo na imagem:
+
+```bash
+fly secrets set YOUTUBE_COOKIES="$(cat youtube_cookies.txt)"
+```
+
+Use uma única Machine para evitar duas instâncias do mesmo bot:
+
+```bash
+fly scale count 1
+```
+
+A Machine usa 512 MB de memória. O processo combina Python, yt-dlp, Deno e
+FFmpeg; 256 MB pode fazer o kernel encerrar o bot por falta de memória.
+
+O arquivo local `youtube_cookies.txt` e o `.env` são ignorados pelo Git e pelo
+Docker. Cookies do YouTube expiram e precisam ser renovados periodicamente.
+O container instala Deno e `yt-dlp-ejs`, necessários para os desafios
+JavaScript atuais do YouTube.

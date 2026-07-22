@@ -1,0 +1,13 @@
+# fly.toml app configuration file generated for zrl-disc-music-bot on 2026-07-22T16:12:03-03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'zrl-disc-music-bot'
+primary_region = 'gru'
+
+[build]
+
+[[vm]]
+  memory = '512mb'
+  cpus = 1

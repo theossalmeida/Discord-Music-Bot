@@ -1,171 +1,255 @@
-from random import choice
+import asyncio
+import ctypes.util
+import logging
+import os
+import tempfile
+from collections import deque
+
 import discord
 from discord.ext import commands
-import yt_dlp as youtube_dl
-from py_yt import VideosSearch
-import os
-from load_dotenv import load_dotenv
+from dotenv import load_dotenv
+import yt_dlp
 
-'''
-PT-BR:
-    Lembre-se de alterar/criar seu arquivo .env com o caminho da pasta de imagens e application id.
-
-EN-US:
-    Remember to create/change your .env file with informations about image folder path and application id
-'''
 
 load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("music-bot")
 
-IMG_FOLDER_PATH = os.getenv('IMG_FOLDER_PATH')
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not configured")
 
-if not DISCORD_TOKEN or not IMG_FOLDER_PATH:
-    print('Please make sure you have DISCORD_TOKEN and IMG_FOLDER_PATH on your .env file, also check for the name of the variables')
-    print('Por favor, certifique-se que as variáveis DISCORD_TOKEN e IMG_FOLDER_PATH estao corretamente salvas no .env')
-    raise Exception
+
+def create_cookie_file():
+    cookies = os.getenv("YOUTUBE_COOKIES")
+    if not cookies:
+        return None
+
+    cookie_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", encoding="utf-8", delete=False
+    )
+    cookie_file.write(cookies)
+    cookie_file.close()
+    os.chmod(cookie_file.name, 0o600)
+    return cookie_file.name
+
+
+COOKIE_FILE = create_cookie_file()
+
+if not discord.opus.is_loaded():
+    opus_library = ctypes.util.find_library("opus")
+    if opus_library:
+        discord.opus.load_opus(opus_library)
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-images_folder = IMG_FOLDER_PATH
 
-# Class to manage music queue
-class MusicQueue:
-    def __init__(self):
-        self.queue = []
-        self.is_playing = False
-        self.vc = None
+def youtube_options():
+    options = {
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+        "retries": 1,
+        "extractor_retries": 1,
+        # Fall back to the official remote EJS bundle if the packaged solver
+        # cannot handle a newly introduced YouTube challenge yet.
+        "remote_components": {"ejs:github"},
+    }
+    if COOKIE_FILE:
+        options["cookiefile"] = COOKIE_FILE
+    return options
 
-    def add_to_queue(self, song, channel):
-        self.queue.append((song, channel))
 
-    def get_next_song(self):
-        if self.queue:
-            return self.queue.pop(0)
-        return None
+def extract_song(query, *, search):
+    target = f"ytsearch1:{query}" if search else query
+    options = youtube_options()
+    if search:
+        # A search only needs a title and video URL. Extracting audio formats at
+        # this point runs YouTube's expensive JS challenge twice and can hang.
+        options["extract_flat"] = "in_playlist"
 
-    def clear_queue(self):
-        self.queue = []
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(target, download=False)
 
-    def get_queue_titles(self):
-        return [song['title'] for song, _ in self.queue]
+    if search:
+        entries = info.get("entries") if info else None
+        if not entries:
+            raise RuntimeError("No YouTube results found")
+        info = entries[0]
 
-music_queue = MusicQueue()
+    if not info:
+        raise RuntimeError("YouTube did not return video information")
+
+    webpage_url = info.get("webpage_url") or info.get("original_url")
+    if search and not webpage_url:
+        result_url = info.get("url")
+        webpage_url = (
+            result_url
+            if result_url and result_url.startswith("http")
+            else f"https://www.youtube.com/watch?v={result_url}"
+        )
+    if not webpage_url:
+        webpage_url = query
+
+    if not search and not info.get("url"):
+        raise RuntimeError("YouTube did not return an audio stream")
+    return {
+        "title": info.get("title", "Título desconhecido"),
+        "webpage_url": webpage_url,
+        "source": info.get("url"),
+    }
+
+
+class MusicPlayer:
+    def __init__(self, guild_id):
+        self.guild_id = guild_id
+        self.queue = deque()
+        self.voice_client = None
+        self.text_channel = None
+        self.play_task = None
+
+    async def enqueue(self, song, voice_channel, text_channel):
+        self.queue.append((song, voice_channel))
+        self.text_channel = text_channel
+        if not self.voice_client or not self.voice_client.is_playing():
+            self.start_next()
+
+    def start_next(self):
+        if self.play_task and not self.play_task.done():
+            return
+        self.play_task = asyncio.create_task(self._play_next())
+
+    async def _play_next(self):
+        if not self.queue:
+            return
+
+        song, voice_channel = self.queue.popleft()
+        try:
+            if not self.voice_client or not self.voice_client.is_connected():
+                self.voice_client = await voice_channel.connect()
+            elif self.voice_client.channel != voice_channel:
+                await self.voice_client.move_to(voice_channel)
+
+            # Stream URLs expire, so resolve the URL again immediately before playback.
+            refreshed = await asyncio.wait_for(
+                asyncio.to_thread(extract_song, song["webpage_url"], search=False),
+                timeout=60,
+            )
+            audio = discord.FFmpegPCMAudio(
+                refreshed["source"],
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                options="-vn",
+            )
+            self.voice_client.play(audio, after=self._after_track)
+            await self.text_channel.send(f'Reproduzindo: {song["title"]}')
+        except Exception:
+            logger.exception("Failed to play %s in guild %s", song["title"], self.guild_id)
+            await self.text_channel.send(
+                f'Não consegui reproduzir **{song["title"]}**. Pulando para a próxima.'
+            )
+            # Schedule after this task has completed so start_next does not see
+            # the current task as still active.
+            bot.loop.call_soon(self.start_next)
+
+    def _after_track(self, error):
+        if error:
+            logger.error("FFmpeg playback error in guild %s: %s", self.guild_id, error)
+        bot.loop.call_soon_threadsafe(self.start_next)
+
+    async def disconnect(self):
+        self.queue.clear()
+        if self.voice_client and self.voice_client.is_connected():
+            await self.voice_client.disconnect()
+        self.voice_client = None
+
+
+players = {}
+
+
+def get_player(guild):
+    return players.setdefault(guild.id, MusicPlayer(guild.id))
+
 
 @bot.event
 async def on_ready():
-    print(f'Bot conectado como {bot.user}')
-    # Send message in discord chat when bot is turned on
-    for guild in bot.guilds:
-        text_channel = guild.text_channels[0]
-        await text_channel.send(file=discord.File(os.path.join(images_folder, 'welcome.png')), content="Rei Macaco na área!")
+    logger.info("Connected as %s", bot.user)
 
-@bot.command(name='play', help='Busca e reproduz uma música do YouTube')
+
+@bot.command(name="play", help="Busca e reproduz uma música do YouTube")
 async def play(ctx, *, search):
-    # Warning if user enter command without being on a voice channel
-    if not ctx.author.voice:
+    if not ctx.guild:
+        await ctx.send("Este comando só funciona dentro de um servidor.")
+        return
+    if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("Você precisa estar em um canal de voz para usar este comando.")
         return
 
-    channel = ctx.author.voice.channel
-
-    # Search for the video user entered
-    videos_search = VideosSearch(search, limit=1, region='BR')
     try:
-        video_result = await videos_search.next()
-        print(video_result['result'][0]['link'])
-        url = video_result['result'][0]['link']
-    except Exception as e:
-        print(f'Erro ao pesquisar musica: {e}')
-        # Images to be sent when bot can't find the music
-        await ctx.send(file=discord.File(os.path.join(images_folder, 'erro.png')), content="Houve um problema ao tentar buscar a música.")
-        return
+        logger.info("Searching YouTube for %r in guild %s", search, ctx.guild.id)
+        async with ctx.typing():
+            song = await asyncio.wait_for(
+                asyncio.to_thread(extract_song, search, search=True), timeout=30
+            )
+        logger.info("YouTube search found %r", song["title"])
+        await get_player(ctx.guild).enqueue(
+            song, ctx.author.voice.channel, ctx.channel
+        )
+        await ctx.send(f'Adicionada à fila: {song["title"]}')
+    except asyncio.TimeoutError:
+        logger.error("YouTube search timed out for %r", search)
+        await ctx.send("O YouTube demorou demais para responder. Tente novamente.")
+    except Exception:
+        logger.exception("YouTube search failed for %r", search)
+        await ctx.send("Houve um problema ao buscar essa música no YouTube.")
 
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-    }
 
-    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            for format in info['formats']:
-                if format['ext'] == 'm4a':
-                    song = {'source': format['url'], 'title': info['title']}
-                    break
-            else:
-                song = {'source': info['formats'][0]['url'], 'title': info['title']}
-            print(f'Playing URL: {song["source"]}')  # Log to verify audio url
-            music_queue.add_to_queue(song, channel)
-
-            # Images to be sent when user ask for a music
-            file_to_send = choice(['emoji.png',
-                                   'emoji1.png',
-                                   'emoji2.png',
-                                   'emoji3.png'])
-            
-            await ctx.send(file=discord.File(os.path.join(images_folder, file_to_send)), content=f'Adicionada à fila: {song["title"]}')
-
-            if not music_queue.is_playing:
-                await play_next(ctx)
-        except Exception as e:
-            print(f'Erro ao extrair informação: {e}')
-            # Images to be sent when bot can't find the music
-            await ctx.send(file=discord.File(os.path.join(images_folder, 'erro.png')), content="Houve um problema ao tentar reproduzir a música.")
-
-async def play_next(ctx):
-    next_song = music_queue.get_next_song()
-    if next_song:
-        music_queue.is_playing = True
-        song, channel = next_song
-
-        if music_queue.vc is None or not music_queue.vc.is_connected():
-            music_queue.vc = await channel.connect()
-        else:
-            await music_queue.vc.move_to(channel)
-
-        music_queue.vc.play(discord.FFmpegPCMAudio(
-            song['source'],  
-            before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", 
-            options="-vn -bufsize 64k"
-        ), after=lambda e: bot.loop.create_task(play_next(ctx)))
-        await ctx.send(f'Reproduzindo: {song["title"]}')
-    else:
-        music_queue.is_playing = False
-
-@bot.command(name='next', help='Pula a música atual e reproduz a próxima da fila')
-async def next(ctx):
-    # Function to skip music
-    if music_queue.vc and music_queue.vc.is_playing():
-        music_queue.vc.stop()
-        await play_next(ctx)
+@bot.command(name="next", aliases=["skip"], help="Pula a música atual")
+async def skip_track(ctx):
+    player = players.get(ctx.guild.id) if ctx.guild else None
+    if player and player.voice_client and player.voice_client.is_playing():
+        # stop() invokes the after callback, which starts exactly one next track.
+        player.voice_client.stop()
+        await ctx.send("Música pulada.")
     else:
         await ctx.send("Não há nenhuma música sendo reproduzida no momento.")
 
-@bot.command(name='fila', help='Mostra as músicas na fila')
-async def fila(ctx):
-    # Function to show all musics in queue
-    queue_titles = music_queue.get_queue_titles()
-    if queue_titles:
-        queue_list = "\n".join([f"{i+1}. {title}" for i, title in enumerate(queue_titles)])
-        await ctx.send(f"Fila de músicas:\n{queue_list}")
-    else:
+
+@bot.command(name="fila", aliases=["queue"], help="Mostra as músicas na fila")
+async def show_queue(ctx):
+    player = players.get(ctx.guild.id) if ctx.guild else None
+    if not player or not player.queue:
         await ctx.send("A fila está vazia.")
+        return
+    titles = [song["title"] for song, _ in player.queue]
+    await ctx.send("Fila de músicas:\n" + "\n".join(
+        f"{index}. {title}" for index, title in enumerate(titles, start=1)
+    ))
 
-@bot.command(name='leave', help='Desconecta o bot do canal de voz')
+
+@bot.command(name="leave", help="Desconecta o bot do canal de voz")
 async def leave(ctx):
-    # Bot send a good bye message when disconnected
-    if music_queue.vc:
-        await music_queue.vc.disconnect()
-        music_queue.clear_queue()
-        music_queue.is_playing = False
-        await ctx.send("To indo embora...")
-    else:
+    player = players.get(ctx.guild.id) if ctx.guild else None
+    if not player or not player.voice_client or not player.voice_client.is_connected():
         await ctx.send("O bot não está conectado a nenhum canal de voz.")
+        return
+    await player.disconnect()
+    await ctx.send("Tô indo embora...")
 
-bot.run(DISCORD_TOKEN)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send("Use `!play nome da música`.")
+        return
+    if isinstance(error, commands.CommandNotFound):
+        return
+    logger.error("Command error", exc_info=error)
+    await ctx.send("Ocorreu um erro ao executar o comando.")
+
+
+if __name__ == "__main__":
+    bot.run(DISCORD_TOKEN, log_handler=None)

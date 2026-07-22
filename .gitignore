@@ -2,3 +2,9 @@
 /*img
 img/*
 img
+.venv
+.claude
+.github
+youtube_cookies.txt
+*.pyc
+__pycache__/
